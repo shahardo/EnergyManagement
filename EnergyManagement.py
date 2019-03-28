@@ -19,10 +19,10 @@ DATA_IO = 'load' # 'save' or 'load'
 PROCESS = 'manual' # 'rl' or 'manual'
 DEBUG_CHARTS = False
 
-battMaxCharge = 3500 # 3.5 TWh
-targetRenewable = 40 #%
-#battMaxCharge = [0, 1000, 2000, 3000, 3500, 4000] # MWh
-#targetRenewable = [0, 10, 20, 30, 40, 50] #%
+#battMaxCharge = 3500 # 3.5 TWh
+#targetRenewable = 40 #%
+battMaxChargeValues = [0, 1000, 2000, 3000, 3500, 4000] # MWh
+targetRenewableValues = [0, 10, 20, 30, 40, 50, 100] #%
 
 if DATA_IO == 'load':
 
@@ -143,145 +143,162 @@ cost[8759] = cost[8758]
 cost = np.array([float(x) for x in cost])
 
 
-# adjust solar production for expected target
-# ===========================================
-
-renewableRatio = renw.sum() / dmnd.sum()
-renewableFactor = targetRenewable / 100 / renewableRatio
-renw *= renewableFactor
-
-
 if PROCESS == 'manual':
   # manual handle batteries
   # =======================
   from scipy import optimize
 
-  battState = 0
-  batt = np.zeros(dmnd.size) # battery charge array
-  wast = np.zeros(dmnd.size) # wasted energy array
+  def doManualOptimization(battMaxCharge, dmnd, renw, cost):
+    battState = 0
+    batt = np.zeros(dmnd.size) # battery charge array
+    wast = np.zeros(dmnd.size) # wasted energy array
 
-  # save dmnd data
-  dmndOrig = np.copy(dmnd)
+    for day in range(365):
+      # find min points in current and next day
+      dayStart = day*24
+      print(x1[dayStart].strftime('%d/%m/%Y'))
+      todaysDemand = dmnd[dayStart : dayStart + 24]
+      todaysMinPos = dayStart + np.argmin(todaysDemand)
+      if day < 364:
+        # regular day: find the minimum demand on the next day. usually at about
+        # 01:00-04:00 on the next day's morning
+        tomorrowsDemand = dmnd[dayStart + 24 : dayStart + 48]
+        tomorrowsMinPos = dayStart + 24 + np.argmin(tomorrowsDemand)
+      else:
+        # on the last day of the year, can't look for minimum on the next day,
+        # so take the last hour of the day. it's good enough
+        tomorrowsMinPos = 365*24
 
-  for day in range(365):
-    # find min points in current and next day
-    dayStart = day*24
-    print(x1[dayStart].strftime('%d/%m/%Y'))
-    todaysDemand = dmnd[dayStart : dayStart + 24]
-    todaysMinPos = dayStart + np.argmin(todaysDemand)
-    if day < 364:
-      # regular day: find the minimum demand on the next day. usually at about
-      # 01:00-04:00 on the next day's morning
-      tomorrowsDemand = dmnd[dayStart + 24 : dayStart + 48]
-      tomorrowsMinPos = dayStart + 24 + np.argmin(tomorrowsDemand)
-    else:
-      # on the last day of the year, can't look for minimum on the next day,
-      # so take the last hour of the day. it's good enough
-      tomorrowsMinPos = 365*24
+      # find total solar production
+      todaysDemand = dmnd[todaysMinPos : tomorrowsMinPos].copy()
+      todaysSolar = renw[todaysMinPos : tomorrowsMinPos]
+      totalSolarProduction = todaysSolar.sum()
+      # cap battery charge by max battery capacity
+      battCharge = min(totalSolarProduction, battMaxCharge - battState)
+      # charge2gridRatio is the ratio between solar power for charging and power for grid use
+      charge2gridRatio = battCharge / totalSolarProduction
+      solarToGrid = todaysSolar * (1-charge2gridRatio)
 
-    # find total solar production
-    todaysDemand = dmnd[todaysMinPos : tomorrowsMinPos].copy()
-    todaysSolar = renw[todaysMinPos : tomorrowsMinPos]
-    totalSolarProduction = todaysSolar.sum()
-    # cap battery charge by max battery capacity
-    battCharge = min(totalSolarProduction, battMaxCharge - battState)
-    # charge2gridRatio is the ratio between solar power for charging and power for grid use
-    charge2gridRatio = battCharge / totalSolarProduction
-    solarToGrid = todaysSolar * (1-charge2gridRatio)
+      # find minimal max fossil power to use when discharging battery
+      # first, subtract the solar power that is routed to the grid from todaysDemand
+      todaysDemand -= solarToGrid
+      todaysWasted = np.array([max(0, -d) for d in todaysDemand]) # if solarToGrid is higher than demand
+      todaysDemand = np.array([max(0,  d) for d in todaysDemand]) # can't have negative demand
 
-    # find minimal max fossil power to use when discharging battery
-    # first, subtract the solar power that is routed to the grid from todaysDemand
-    todaysDemand -= solarToGrid
-    todaysWasted = np.array([max(0, -d) for d in todaysDemand]) # if solarToGrid is higher than demand
-    todaysDemand = np.array([max(0,  d) for d in todaysDemand]) # can't have negative demand
+      # dischargeBattFun(targetDemand) returns the max power demand when discharging the battery
+      # above targetDemand
+      def dischargeBattFun(targetDemand, returnAllData = False):
+        targetDemand = targetDemand[0] # targetDemand received as array
+        todaysModifiedDemand = todaysDemand.copy() # so todaysDemand on the outer scope won't change
+        curCharge = battState
+        todaysBattState = np.zeros(todaysDemand.size)
+        for h in range(todaysDemand.size):
+          # charge the battery from solar
+          curCharge += todaysSolar[h]*charge2gridRatio
+          todaysWasted[h] += max(0, curCharge - battMaxCharge) # add amount of wasted solar energy
+          curCharge = min(curCharge, battMaxCharge) # cap charge with battery max capacity
+          # if demand is higher than maxDemand, start discharging the battery
+          if todaysModifiedDemand[h] > targetDemand:
+            # calc discharge amount
+            toDischarge = todaysModifiedDemand[h] - targetDemand
+            toDischarge = min(toDischarge, curCharge)
+            # reduce the demand by the discharge
+            todaysModifiedDemand[h] -= toDischarge
+            # discharge the battery
+            curCharge -= toDischarge
+          # save battery charege state
+          todaysBattState[h] = curCharge
 
-    # dischargeBattFun(targetDemand) returns the max power demand when discharging the battery
-    # above targetDemand
-    def dischargeBattFun(targetDemand, returnAllData = False):
-      targetDemand = targetDemand[0] # targetDemand received as array
-      todaysModifiedDemand = todaysDemand.copy() # so todaysDemand on the outer scope won't change
-      curCharge = battState
-      todaysBattState = np.zeros(todaysDemand.size)
-      for h in range(todaysDemand.size):
-        # charge the battery from solar
-        curCharge += todaysSolar[h]*charge2gridRatio
-        todaysWasted[h] += max(0, curCharge - battMaxCharge) # add amount of wasted solar energy
-        curCharge = min(curCharge, battMaxCharge) # cap charge with battery max capacity
-        # if demand is higher than maxDemand, start discharging the battery
-        if todaysModifiedDemand[h] > targetDemand:
-          # calc discharge amount
-          toDischarge = todaysModifiedDemand[h] - targetDemand
-          toDischarge = min(toDischarge, curCharge)
-          # reduce the demand by the discharge
-          todaysModifiedDemand[h] -= toDischarge
-          # discharge the battery
-          curCharge -= toDischarge
-        # save battery charege state
-        todaysBattState[h] = curCharge
+        # debug reuslts
+    #    plt.plot(todaysDemand, label='demand')
+    #    plt.plot(todaysModifiedDemand, label='mod-demand')
+    #    plt.plot(todaysSolar, label='renewables')
+    #    plt.plot(todaysBattState, label='batt')
+    #    plt.title('electricity data')
+    #    plt.ylabel('MW')
+    #    plt.legend(loc=2)
+    #    plt.show()
+
+        # return short or long format
+        if not returnAllData:
+          return todaysModifiedDemand.max()
+        return todaysModifiedDemand.max(), todaysModifiedDemand, todaysBattState, todaysWasted
+
+      # use dischargeBattFun to find the minimal possible maxDemand
+      maxDemand = todaysDemand.max()
+      minMaxDemand = optimize.fmin(dischargeBattFun, maxDemand * 0.9)
+
+      # put updated values in arrays
+      minMaxDemand, todaysModifiedDemand, todaysBattState, todaysWasted = dischargeBattFun([minMaxDemand], returnAllData = True)
+      dmnd[todaysMinPos : todaysMinPos + todaysModifiedDemand.size] = todaysModifiedDemand
+      batt[todaysMinPos : todaysMinPos + todaysModifiedDemand.size] = todaysBattState
+      wast[todaysMinPos : todaysMinPos + todaysModifiedDemand.size] = todaysWasted
+      battState = todaysBattState[-1]
 
       # debug reuslts
-  #    plt.plot(todaysDemand, label='demand')
-  #    plt.plot(todaysModifiedDemand, label='mod-demand')
-  #    plt.plot(todaysSolar, label='renewables')
-  #    plt.plot(todaysBattState, label='batt')
-  #    plt.title('electricity data')
-  #    plt.ylabel('MW')
-  #    plt.legend(loc=2)
-  #    plt.show()
+      if DEBUG_CHARTS:
+        plt.plot(todaysDemand, label='demand')
+        plt.plot(todaysModifiedDemand, label='mod-demand')
+        plt.plot(todaysSolar, label='renewables')
+        plt.plot(todaysBattState, label='batt')
+        plt.plot(todaysWasted, label='wasted')
+        plt.title(x1[dayStart].strftime('%d/%m/%Y'))
+        plt.ylabel('MW')
+        plt.legend(loc=2)
+        plt.show()
 
-      # return short or long format
-      if not returnAllData:
-        return todaysModifiedDemand.max()
-      return todaysModifiedDemand.max(), todaysModifiedDemand, todaysBattState, todaysWasted
+      return dmnd, batt, wast
 
-    # use dischargeBattFun to find the minimal possible maxDemand
-    maxDemand = todaysDemand.max()
-    minMaxDemand = optimize.fmin(dischargeBattFun, maxDemand * 0.9)
+  # prepare output file
+  curDate = datetime.today().strftime('%Y-%m-%d')
+  fname = './data/Results - {}.xlsx'.format(curDate)
+  if os.path.isfile(fname):
+    os.remove(fname)
 
-    # put updated values in arrays
-    minMaxDemand, todaysModifiedDemand, todaysBattState, todaysWasted = dischargeBattFun([minMaxDemand], returnAllData = True)
-    dmnd[todaysMinPos : todaysMinPos + todaysModifiedDemand.size] = todaysModifiedDemand
-    batt[todaysMinPos : todaysMinPos + todaysModifiedDemand.size] = todaysBattState
-    wast[todaysMinPos : todaysMinPos + todaysModifiedDemand.size] = todaysWasted
-    battState = todaysBattState[-1]
-
-    # debug reuslts
-    if DEBUG_CHARTS:
-      plt.plot(todaysDemand, label='demand')
-      plt.plot(todaysModifiedDemand, label='mod-demand')
-      plt.plot(todaysSolar, label='renewables')
-      plt.plot(todaysBattState, label='batt')
-      plt.plot(todaysWasted, label='wasted')
-      plt.title(x1[dayStart].strftime('%d/%m/%Y'))
-      plt.ylabel('MW')
-      plt.legend(loc=2)
-      plt.show()
-
-  # save output values
-  fname = './data/Results - {}pcnt renew, {} storage.xlsx'.format(targetRenewable, battMaxCharge)
-  if not os.path.isfile(fname):
-    # create workbook
-    wb = openpyxl.Workbook()
-    ws = wb.worksheets[0]
-    ws.title = 'Results'
-    ws['A1'] = 'datetime'
-    ws['C1'] = 'demand-orig'
-    ws['D1'] = 'demand-mod'
-    ws['E1'] = 'renewables'
-    ws['F1'] = 'battery'
-    ws['G1'] = 'waste'
-    wb.save(fname)
-
-  print('saving results to excel')
-  wb = load_workbook(filename=fname, read_only=False)
+  # create workbook
+  wb = openpyxl.Workbook()
   ws = wb.worksheets[0]
-  for line in range(dmnd.size):
-    ws.cell(row=line+2, column=1).value = x1[line]
-    ws.cell(row=line+2, column=3).value = float(dmndOrig[line])
-    ws.cell(row=line+2, column=4).value = float(dmnd[line])
-    ws.cell(row=line+2, column=5).value = float(renw[line])
-    ws.cell(row=line+2, column=6).value = float(batt[line])
-    ws.cell(row=line+2, column=7).value = float(wast[line])
+  ws.title = 'Results'
+  ws['A1'] = 'datetime'
+  ws['B1'] = 'hour'
+  ws['C1'] = 'ren-part'
+  ws['D1'] = 'storage'
+  ws['E1'] = 'demand-orig'
+  ws['F1'] = 'demand-mod'
+  ws['G1'] = 'renewables'
+  ws['H1'] = 'battery'
+  ws['I1'] = 'waste'
+  wb.save(fname)
+  outLine = 2
+
+  # loop for all ren/storage options
+  for maxBat in battMaxChargeValues:
+    for renPart in targetRenewableValues:
+      print('running optimization')
+      print('batt max charge: {}, target renewables: {}%'.format(maxBat, renPart))
+
+      # adjust solar production for expected target
+      renewableRatio = renw.sum() / dmnd.sum()
+      renewableFactor = renPart / 100 / renewableRatio
+      renwAdjusted = renw * renewableFactor
+
+      # run optimization for a full year, according to batt-max-charte and target-renewables
+      # use a copy of dmnd since it's going to change during optimization
+      dmndMod, batt, wast = doManualOptimization(maxBat, np.copy(dmnd), renwAdjusted, cost)
+
+      print('saving results to excel')
+#      wb = load_workbook(filename=fname, read_only=False)
+#      ws = wb.worksheets[0]
+      for i in range(dmnd.size):
+        ws.cell(row=outLine, column=1).value = x1[i]
+        ws.cell(row=outLine, column=3).value = renPart/100
+        ws.cell(row=outLine, column=4).value = maxBat
+        ws.cell(row=outLine, column=5).value = float(dmnd[i])
+        ws.cell(row=outLine, column=6).value = float(dmndMod[i])
+        ws.cell(row=outLine, column=7).value = float(renwAdjusted[i])
+        ws.cell(row=outLine, column=8).value = float(batt[i])
+        ws.cell(row=outLine, column=9).value = float(wast[i])
+        outLine +=1
 
   wb.save(fname)
   print('done!')
