@@ -4,6 +4,7 @@ import numpy as np
 import os.path
 import pickle
 import random
+import time
 from datetime import datetime, timedelta
 from pprint import pprint
 import openpyxl
@@ -11,20 +12,28 @@ from openpyxl import load_workbook
 import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline
 
+# # set IPython charts inline (use 'qt' for a new Qt window)
+# from IPython import get_ipython
+# get_ipython().run_line_magic('matplotlib', 'inline')
 
 # run parameters
 # ==============
 
 DATA_IO = 'load' # 'save' or 'load'
-PROCESS = 'manual' # 'rl' or 'manual'
+PROCESS = 'rl' # 'rl' or 'manual'
 DEBUG_CHARTS = False
+NUMBER_OF_RUNS = 'single' # 'single' or 'multiple'
 
-#battMaxCharge = 3500 # 3.5 TWh
-#targetRenewable = 40 #%
-battMaxChargeValues = [0, 1000, 2000, 3000, 3500, 4000] # MWh
-targetRenewableValues = [0, 10, 20, 30, 40, 50, 100] #%
+# prepare run parameters
 
-if DATA_IO == 'load':
+if NUMBER_OF_RUNS == 'single':
+  battMaxCharge = 3500 # 3.5 TWh
+  targetRenewable = 40 #%
+else:
+  battMaxChargeValues = [0, 1000, 2000, 3000, 3500, 4000] # MWh
+  targetRenewableValues = [0, 10, 20, 30, 40, 50, 100] #%
+
+if DATA_IO == 'save':
 
   # read electricity data
   # =====================
@@ -34,31 +43,31 @@ if DATA_IO == 'load':
 
   # read data
   print('reading electricity file...')
-  fname = './data/Electricity Data.xlsx'
+  x1 = []
+  dmnd = []
+  renw = []
+  batt = []
+
+  fname = './data/Results - 40pcnt renew, 3500 storage.xlsx'
   wb = load_workbook(filename=fname, read_only=True)
-  ws = wb['Electricity Data']
+  ws = wb['Results']
   for row in ws.iter_rows(min_row=4, max_row=8763):
-    elect.append([row[0].value, row[2].value, row[3].value, row[6].value])
+    x1.append(row[0].value)
+    dmnd.append(row[2].value)
+    renw.append(row[4].value)
+    batt.append(row[5].value)
 
-  # fix problem - time 00:00 should advance one day
-  for row in elect[1:]:
-    if row[0].hour==0:
-      row[0] += timedelta(days=1)
+  x1 = np.array(x1)
+  dmnd = np.array(dmnd)
+  renw = np.array(renw)
+  batt = np.array(batt)
 
-  # elect content:
-  #  [datatime, demand [MW], solar-generation [MW], marginal cost[ag/kWh]] - every hour
-
-  pprint(elect[:5])
-
-  x = [r[0] for r in elect]
-  dmnd = np.array([r[1] for r in elect])
-  renw = np.array([r[2] for r in elect])
-  cost = np.array([r[3] for r in elect])
+  # pprint([[x1[i], dmnd[i], renw[i], batt[i]] for i in range(5)])
 
   #plt.plot(x[:150], dmnd[:150], 'demand', x[:150], renw[:150], 'renewables', x[:150], cost[:150], 'cost')
-  plt.plot(x[:150], dmnd[:150], label='demand')
-  plt.plot(x[:150], renw[:150], label='renewables')
-  plt.plot(x[:150], cost[:150], label='cost')
+  plt.plot(x1[:150], dmnd[:150], label='demand')
+  plt.plot(x1[:150], renw[:150], label='renewables')
+  plt.plot(x1[:150], batt[:150], label='battery')
   plt.title('electricity data')
   plt.ylabel('MW')
   plt.legend(loc=2)
@@ -101,10 +110,7 @@ if DATA_IO == 'load':
   # use x timestamp since its integer
   xts = [r[0].timestamp() for r in meteo]
 
-  # set x1 from the hours in elect array
-  x1 = [r[0] for r in elect]
-
-  # convert to timestamp, for interpolation
+  # convert date-time to timestamp, for interpolation
   x1ts = [xx.timestamp() for xx in x1]
 
   # interpolate hourly meteo using cuibic spline interpolation
@@ -123,7 +129,7 @@ if DATA_IO == 'load':
   pickle.dump(y1, outfile)
   pickle.dump(dmnd, outfile)
   pickle.dump(renw, outfile)
-  pickle.dump(cost, outfile)
+  pickle.dump(batt, outfile)
   outfile.close()
 
 else:
@@ -134,13 +140,8 @@ else:
   y1 = pickle.load(infile)
   dmnd = pickle.load(infile)
   renw = pickle.load(infile)
-  cost = pickle.load(infile)
+  batt = pickle.load(infile)
   infile.close()
-
-# fix cost is a string
-# TODO DELME
-cost[8759] = cost[8758]
-cost = np.array([float(x) for x in cost])
 
 
 if PROCESS == 'manual':
@@ -148,7 +149,7 @@ if PROCESS == 'manual':
   # =======================
   from scipy import optimize
 
-  def doManualOptimization(battMaxCharge, dmnd, renw, cost):
+  def doManualOptimization(battMaxCharge, dmnd, renw):
     battState = 0
     batt = np.zeros(dmnd.size) # battery charge array
     wast = np.zeros(dmnd.size) # wasted energy array
@@ -176,7 +177,7 @@ if PROCESS == 'manual':
       # cap battery charge by max battery capacity
       battCharge = min(totalSolarProduction, battMaxCharge - battState)
       # charge2gridRatio is the ratio between solar power for charging and power for grid use
-      charge2gridRatio = battCharge / totalSolarProduction
+      charge2gridRatio = battCharge / totalSolarProduction if totalSolarProduction != 0 else 0
       solarToGrid = todaysSolar * (1-charge2gridRatio)
 
       # find minimal max fossil power to use when discharging battery
@@ -247,7 +248,7 @@ if PROCESS == 'manual':
         plt.legend(loc=2)
         plt.show()
 
-      return dmnd, batt, wast
+    return dmnd, batt, wast
 
   # prepare output file
   curDate = datetime.today().strftime('%Y-%m-%d')
@@ -284,7 +285,7 @@ if PROCESS == 'manual':
 
       # run optimization for a full year, according to batt-max-charte and target-renewables
       # use a copy of dmnd since it's going to change during optimization
-      dmndMod, batt, wast = doManualOptimization(maxBat, np.copy(dmnd), renwAdjusted, cost)
+      dmndMod, batt, wast = doManualOptimization(maxBat, np.copy(dmnd), renwAdjusted)
 
       print('saving results to excel')
 #      wb = load_workbook(filename=fname, read_only=False)
@@ -311,18 +312,23 @@ if PROCESS == 'rl':
   from tensorforce.agents import PPOAgent, DQFDAgent
   from tensorforce.execution import Runner
 
+
   #  normalize input
+  # =======================
   def norm(x):
     # normalize data to have avg=0, scale=2 (+1..-1)
     scale = (x.max()-x.min())
     return x/scale
+
   dmnd = norm(dmnd)
   renw = norm(renw)
-  cost = norm(cost)
-  #batt = norm(batt)
+#  cost = norm(cost)
+  batt = norm(batt)
   y1 = norm(y1)
 
+
   # prepare environment
+  # =======================
 
   class EnergyEnvironment(Environment):
     """
@@ -340,6 +346,9 @@ if PROCESS == 'rl':
       # reset episode hour. will run for 24*14 hours
       self.episodeHour = 0
 
+      # reset thrown electricity accumulator
+      self.thrownElect = 0
+
       # start episode from random day
       # start from day 2 (to allow for 24 hours of past data)
       # end 2 weeks befor year end (to allow for 14 days episode)
@@ -348,7 +357,7 @@ if PROCESS == 'rl':
 
       # some constants
       self.battMaxCharge = 0.1 # max demand ~12,000. take 10% of that. was 1000
-      self.episodeHours = 1*24
+      self.episodeHours = 1*24 # 14 days * 24 hours
       self.electTariff = 0.1
 
       return self.currentState()
@@ -371,7 +380,7 @@ if PROCESS == 'rl':
     # positive to charge, negative to discharge
     def execute(self, action):
       # make sure action is a scalar
-      if isinstance(action,np.ndarray):
+      if isinstance(action, np.ndarray):
         assert(action.size==1)
         action = action[0]
 
@@ -389,15 +398,17 @@ if PROCESS == 'rl':
 
       # charge/discharge battery
       netDemand += -action
-      print('{},'.format(action), end='') # TODO: DELME
       self.battCharge += action
+      print('{},'.format(action), end='') # TODO: DELME
 
       # collect thrown away ren elect
       if netDemand > 0:
-        thrownElect = netDemand # TODO: sum thrownElect
+        self.thrownElect += netDemand
         netDemand = 0
 
       # calc electricity cost
+      # at this stage, netDemand is either negative (need to generate
+      # with fossil means), or zero
       electCost = -netDemand * self.electTariff # cost[self.hour]
 
       # get terminal state
@@ -428,9 +439,12 @@ if PROCESS == 'rl':
   print('creating environment')
   env = EnergyEnvironment()
 
+
   # Instantiate a Tensorforce agent
-  networkFirstLayer = env.states['shape']*2 # two times the states space
-  networkLastLayer = env.actions['shape']*10 # ten times the actions space
+  # ===============================
+
+  networkFirstLayer = env.states['shape']*2 # two times the states space - 2*73
+  networkLastLayer = env.actions['shape']*10 # ten times the actions space - 10*1
 
   # prepare agent
 
@@ -443,7 +457,68 @@ if PROCESS == 'rl':
         dict(type='dense', size=int((networkFirstLayer*networkLastLayer)**0.5)), # geometric average of first and last
         dict(type='dense', size=networkLastLayer),
       ],
-      step_optimizer=dict(type='adam', learning_rate=1e-4)
+      step_optimizer=dict(type='adam', learning_rate=1e-2)
+    )
+    return agent
+
+  def createPPO2Agent():
+    # based on: https://github.com/tensorforce/tensorforce/blob/master/examples/quickstart.py
+    agent = PPOAgent(
+      states=env.states,
+      actions=env.actions,
+      network=[
+        dict(type='dense', size=64),
+        dict(type='dense', size=32)
+      ],
+      # Agent
+      states_preprocessing=None,
+      actions_exploration=None,
+      reward_preprocessing=None,
+      # MemoryModel
+      update_mode=dict(
+          unit='episodes',
+          # 10 episodes per update
+          batch_size=10,
+          # Every 10 episodes
+          frequency=10
+      ),
+      memory=dict(
+          type='latest',
+          include_next_states=False,
+          capacity=5000
+      ),
+      # DistributionModel
+      distributions=None,
+      entropy_regularization=0.01,
+      # PGModel
+      baseline_mode='states',
+      baseline=dict(
+          type='mlp',
+          sizes=[32, 32]
+      ),
+      baseline_optimizer=dict(
+          type='multi_step',
+          optimizer=dict(
+              type='adam',
+              learning_rate=1e-3
+          ),
+          num_steps=5
+      ),
+      gae_lambda=0.97,
+      # PGLRModel
+      likelihood_ratio_clipping=0.2,
+      # PPOAgent
+      step_optimizer=dict(
+          type='adam',
+          learning_rate=1e-3
+      ),
+      subsampling_fraction=0.2,
+      optimization_steps=25,
+      execution=dict(
+          type='single',
+          session_config=None,
+          distributed_spec=None
+      )
     )
     return agent
 
@@ -466,39 +541,82 @@ if PROCESS == 'rl':
       terminal = terminal,
       reward = reward
     )
-    agent.import_demonstrations(demonstrations=demonstrations)
-    agent.pretrain(steps=1000)
+    agent.import_demonstrations(demonstrations = demonstrations)
+    agent.pretrain(steps = 24 * 10)
     return agent
+
 
   # create agent and feed demonstration data
   # =========================================
 
-  print('preparing demonstration data')
   states = []
   actions = []
   terminals = []
   rewards = []
 
-  for day in range(1, 356-7):
-    env.reset(day)
-    terminal = False
-    while not terminal:
-      action = batt[day] - batt[day-1]
-      state, terminal, reward = env.execute(action)
-      actions.append(action)
-      states.append(state)
-      rewards.append(reward)
-      terminals.append(terminal)
-      day +=1
+  AGENT_TYPE = 'ppo'
+
+  if 'dqfd' == AGENT_TYPE:
+    print('preparing demonstration data')
+    for day in range(1, 356-7):
+      env.reset(day)
+      terminal = False
+      while not terminal:
+        action = batt[day] - batt[day-1]
+        state, terminal, reward = env.execute(action)
+        if terminal: print()
+        actions.append(action)
+        states.append(state)
+        rewards.append(reward)
+        terminals.append(terminal)
+        day += 1
 
   # create agent and feed it with demonstration data
-  print('creating agent')
-  agent = createDQFDAgent(states, actions, rewards, terminals)
+  print('creating agent ({})'.format(AGENT_TYPE))
+  if 'dqfd' == AGENT_TYPE:
+    agent = createDQFDAgent(states, actions, rewards, terminals)
+  elif 'ppo' == AGENT_TYPE:
+    agent = createPPOAgent()
+  elif 'ppo2' == AGENT_TYPE:
+    agent = createPPO2Agent()
+  else:
+    assert('bad agent type')
+
 
   # Create the runner
+  # =======================
+
   print('creating runner')
   history = {}
   runner = Runner(agent=agent, environment=env, history=history)
+
+  # if False:
+  #   # open output chart window
+  #   # create figure (will only create new window if needed)
+  #   plt.figure()
+  #   # Generate plot1
+  #   plt.plot(range(10, 20))
+  #   # Show the plot in non-blocking mode
+  #   plt.show(block=False)
+
+#  fig, ax = plt.subplots()
+#  ax.plot(range(5))
+#  fig.canvas.manager.show()
+#  # this makes sure that the gui window gets shown
+#  # if this is needed depends on rcparams, this is just to be safe
+#  fig.canvas.flush_events()
+#  # this make sure that if the event loop integration is not
+#  # set up by the gui framework the plot will update
+#  time.sleep(0.5)
+#  fig.canvas.flush_events()
+
+  # moving average helper fun
+  window_width = 10
+  def movingAverage(data):
+    cumsum_vec = np.cumsum(np.insert(data, 0, 0))
+    return (cumsum_vec[window_width:] - cumsum_vec[:-window_width]) / window_width
+
+  rewares = []
 
   # Callback function printing episode statistics
   def episode_finished(r):
@@ -507,6 +625,17 @@ if PROCESS == 'rl':
         ts=r.episode_timestep,
         reward=r.episode_rewards[-1])
     )
+    if r.episode%10==0:
+      rewards.append(r.episode_rewards[-1])
+#    ax.plot(rewards)
+#    fig.canvas.manager.show()
+#    fig.canvas.flush_events()
+    if r.episode%50==0:
+      plt.figure()
+      plt.plot(rewards)
+      plt.plot(movingAverage(rewards))
+      plt.show()
+
     return True
 
   # Start learning
